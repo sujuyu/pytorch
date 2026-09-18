@@ -14,16 +14,48 @@
 
 #include <torch/csrc/utils/pybind.h>
 
+#include <memory>
+#include <utility>
+
 namespace torch::inductor {
+
+namespace {
+
+// Constructing a runner dlopens the compiled artifact and copies its constants
+// to the device. For a multi-GiB model that is hundreds of milliseconds during
+// which no interpreter state is touched, so holding the GIL across it makes
+// concurrent loads from Python threads serialize on the interpreter instead of
+// on the hardware.
+//
+// py::call_guard<py::gil_scoped_release> cannot be used with py::init:
+// class_::init_instance() would then register the new instance while the GIL is
+// released, racing on internals.registered_instances
+// (https://github.com/pybind/pybind11/issues/5473). Releasing inside the
+// factory instead confines the release to the C++ constructor, so the GIL is
+// reacquired before pybind touches any interpreter state -- including while
+// unwinding, if the constructor throws.
+template <typename Runner, typename... Args>
+auto init_releasing_gil() {
+  return py::init([](Args... args) {
+    py::gil_scoped_release no_gil;
+    return std::make_unique<Runner>(std::forward<Args>(args)...);
+  });
+}
+
+} // namespace
 
 void initAOTIRunnerBindings(PyObject* module) {
   auto rootModule = py::handle(module).cast<py::module>();
   auto m = rootModule.def_submodule("_aoti");
 
   py::class_<AOTIModelContainerRunnerCpu>(m, "AOTIModelContainerRunnerCpu")
-      .def(py::init<const std::string&, int>())
+      .def(init_releasing_gil<
+           AOTIModelContainerRunnerCpu,
+           const std::string&,
+           int>())
       .def(
-          py::init<
+          init_releasing_gil<
+              AOTIModelContainerRunnerCpu,
               const std::string&,
               size_t,
               std::unordered_map<std::string, at::Tensor>&>(),
@@ -34,7 +66,8 @@ void initAOTIRunnerBindings(PyObject* module) {
           "run",
           &AOTIModelContainerRunnerCpu::run,
           py::arg("inputs"),
-          py::arg("stream_handle") = nullptr)
+          py::arg("stream_handle") = nullptr,
+          py::call_guard<py::gil_scoped_release>())
       .def("get_call_spec", &AOTIModelContainerRunnerCpu::get_call_spec)
       .def(
           "get_constant_names_to_original_fqns",
@@ -70,21 +103,31 @@ void initAOTIRunnerBindings(PyObject* module) {
 
 #ifdef USE_CUDA
   py::class_<AOTIModelContainerRunnerCuda>(m, "AOTIModelContainerRunnerCuda")
-      .def(py::init<const std::string&, int>())
-      .def(py::init<const std::string&, int, const std::string&>())
-      .def(py::init<
+      .def(init_releasing_gil<
+           AOTIModelContainerRunnerCuda,
+           const std::string&,
+           int>())
+      .def(init_releasing_gil<
+           AOTIModelContainerRunnerCuda,
+           const std::string&,
+           int,
+           const std::string&>())
+      .def(init_releasing_gil<
+           AOTIModelContainerRunnerCuda,
            const std::string&,
            int,
            const std::string&,
            const std::string&>())
-      .def(py::init<
+      .def(init_releasing_gil<
+           AOTIModelContainerRunnerCuda,
            const std::string&,
            int,
            const std::string&,
            const std::string&,
            const bool>())
       .def(
-          py::init<
+          init_releasing_gil<
+              AOTIModelContainerRunnerCuda,
               const std::string&,
               size_t,
               const std::string&,
@@ -99,7 +142,8 @@ void initAOTIRunnerBindings(PyObject* module) {
           "run",
           &AOTIModelContainerRunnerCuda::run,
           py::arg("inputs"),
-          py::arg("stream_handle") = nullptr)
+          py::arg("stream_handle") = nullptr,
+          py::call_guard<py::gil_scoped_release>())
       .def("get_call_spec", &AOTIModelContainerRunnerCuda::get_call_spec)
       .def(
           "get_constant_names_to_original_fqns",
@@ -143,15 +187,24 @@ void initAOTIRunnerBindings(PyObject* module) {
 #endif
 #ifdef USE_XPU
   py::class_<AOTIModelContainerRunnerXpu>(m, "AOTIModelContainerRunnerXpu")
-      .def(py::init<const std::string&, int>())
-      .def(py::init<const std::string&, int, const std::string&>())
-      .def(py::init<
+      .def(init_releasing_gil<
+           AOTIModelContainerRunnerXpu,
+           const std::string&,
+           int>())
+      .def(init_releasing_gil<
+           AOTIModelContainerRunnerXpu,
+           const std::string&,
+           int,
+           const std::string&>())
+      .def(init_releasing_gil<
+           AOTIModelContainerRunnerXpu,
            const std::string&,
            int,
            const std::string&,
            const std::string&>())
       .def(
-          py::init<
+          init_releasing_gil<
+              AOTIModelContainerRunnerXpu,
               const std::string&,
               size_t,
               const std::string&,
@@ -166,7 +219,8 @@ void initAOTIRunnerBindings(PyObject* module) {
           "run",
           &AOTIModelContainerRunnerXpu::run,
           py::arg("inputs"),
-          py::arg("stream_handle") = nullptr)
+          py::arg("stream_handle") = nullptr,
+          py::call_guard<py::gil_scoped_release>())
       .def("get_call_spec", &AOTIModelContainerRunnerXpu::get_call_spec)
       .def(
           "get_constant_names_to_original_fqns",
@@ -211,12 +265,16 @@ void initAOTIRunnerBindings(PyObject* module) {
 #if defined(USE_MPS) && defined(__APPLE__) && \
     !(defined(FBCODE_CAFFE2) || defined(OVRSOURCE))
   py::class_<AOTIModelContainerRunnerMps>(m, "AOTIModelContainerRunnerMps")
-      .def(py::init<const std::string&, int>())
+      .def(init_releasing_gil<
+           AOTIModelContainerRunnerMps,
+           const std::string&,
+           int>())
       .def(
           "run",
           &AOTIModelContainerRunnerMps::run,
           py::arg("inputs"),
-          py::arg("stream_handle") = nullptr)
+          py::arg("stream_handle") = nullptr,
+          py::call_guard<py::gil_scoped_release>())
       .def("get_call_spec", &AOTIModelContainerRunnerMps::get_call_spec)
       .def(
           "get_constant_names_to_original_fqns",

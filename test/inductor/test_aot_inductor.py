@@ -10,6 +10,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 import zipfile
@@ -697,6 +699,105 @@ class AOTInductorTestsTemplate:
         self.assertGreaterEqual(parallel_windows, 1)
         self.assertGreater(task_count, parallel_windows)
         self.assertEqual(optimized(*example_inputs), model(*example_inputs))
+
+    def test_model_loading_and_execution_release_gil(self):
+        if self.device != "cuda":
+            raise unittest.SkipTest("requires CUDA")
+
+        class Model(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                # Large enough that materializing the constants dominates the
+                # construction, leaving the canary thread a window to run in.
+                self.linear = torch.nn.Linear(2048, 2048)
+
+            def forward(self, x):
+                return self.linear(x)
+
+        example_inputs = (torch.randn(2, 2048, device=self.device),)
+        model = Model().to(self.device)
+
+        def canary_steps_during(call):
+            # A binding that holds the GIL for the whole C++ call never lets the
+            # canary thread run, so the difference is exactly zero rather than
+            # merely small. This is a presence check, not a timing threshold.
+            stop = threading.Event()
+            steps = 0
+
+            def canary():
+                nonlocal steps
+                while not stop.is_set():
+                    steps += 1
+
+            thread = threading.Thread(target=canary)
+            thread.start()
+            try:
+                # Do not start counting until the canary is actually running.
+                while steps == 0:
+                    time.sleep(0.001)
+                before = steps
+                result = call()
+                after = steps
+            finally:
+                stop.set()
+                thread.join()
+            del result
+            return after - before
+
+        so_path = AOTIRunnerUtil.legacy_compile(model, example_inputs)
+
+        # The first construction and the first run in a process do one-time
+        # device work that yields the GIL on its own. Measuring those would pass
+        # whether or not the binding releases, so warm them up first and measure
+        # a second runner.
+        warmup = torch._C._aoti.AOTIModelContainerRunnerCuda(so_path, 1, self.device)
+        warmup.run([example_inputs[0]])
+        del warmup
+
+        runner = None
+
+        def construct_runner():
+            nonlocal runner
+            runner = torch._C._aoti.AOTIModelContainerRunnerCuda(
+                so_path, 1, self.device
+            )
+            return runner
+
+        self.assertGreater(canary_steps_during(construct_runner), 0)
+        # Only this runner's first run() is measured. It faults in the
+        # artifact's device modules, so it spans a window worth observing;
+        # steady-state runs only enqueue kernels asynchronously.
+        self.assertGreater(
+            canary_steps_during(lambda: runner.run([example_inputs[0]])), 0
+        )
+
+        package_path = AOTIRunnerUtil.compile(model, example_inputs)
+        with tempfile.TemporaryDirectory() as extracted:
+            # Load from an already-extracted directory rather than the .pt2
+            # itself. Unpacking the zip yields the GIL on its own -- measured at
+            # tens of thousands of canary steps with the bindings unchanged --
+            # which would mask a constructor that never releases.
+            with zipfile.ZipFile(package_path) as archive:
+                archive.extractall(extracted)
+
+            loader = None
+
+            def construct_loader():
+                nonlocal loader
+                loader = torch._C._aoti.AOTIModelPackageLoader(
+                    extracted, "model", False, 1, -1
+                )
+                return loader
+
+            self.assertGreater(canary_steps_during(construct_loader), 0)
+            # boxed_run steals its inputs and clears the list it was handed, so
+            # it gets a fresh list. It is the path AOTICompiledModel.__call__
+            # takes, and the one binding here that hand-rolls the release
+            # rather than using a call_guard.
+            self.assertGreater(
+                canary_steps_during(lambda: loader.boxed_run([example_inputs[0]])),
+                0,
+            )
 
     def test_output_path_1(self):
         class Model(torch.nn.Module):
